@@ -2,224 +2,168 @@
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 session_start();
+include '../config/db.php';
 
-if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'Admin') {
+// Check if parent is logged in
+if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'Parents') {
     header("Location: ../login.php");
     exit;
 }
 
-include '../config/db.php';
+$parent_id = $_SESSION['user_id'];
+$_SESSION['user_id'] = $parent_id; // store in session
 
-// ====== FETCH COUNTS ======
-$studentsCount = $conn->query("SELECT COUNT(*) AS total FROM students")->fetch_assoc()['total'];
-$teachersCount = $conn->query("SELECT COUNT(*) AS total FROM teachers")->fetch_assoc()['total'];
-$classesCount  = $conn->query("SELECT COUNT(*) AS total FROM classes")->fetch_assoc()['total'];
-
-// ====== RECENT ACTIVITY (Last 5 registered users) ======
-$recentActivity = $conn->query("
-    SELECT username, creation_date
-    FROM users
-    ORDER BY creation_date DESC
-    LIMIT 5
+// Fetch children linked to this parent via CNIC
+$children = [];
+$stmt = $conn->prepare("
+    SELECT s.student_id, s.student_name, c.class_name
+    FROM students s
+    JOIN classes c ON s.class_id = c.class_id
+    JOIN users u ON u.cnic = s.father_cnic
+    WHERE u.user_id = ?
+      AND u.role = 'Parents'
 ");
-?>
+$stmt->bind_param("i", $parent_id);
+$stmt->execute();
+$result = $stmt->get_result();
+while ($row = $result->fetch_assoc()) {
+    $children[$row['student_id']] = $row;
+}
+$stmt->close();
 
-<!DOCTYPE html>
+// Set default child in session if not set
+if (!empty($children) && !isset($_SESSION['child_id'])) {
+    $_SESSION['child_id'] = array_key_first($children);
+}
+
+// Fetch attendance percentage for each child
+$attendance = [];
+foreach ($children as $child_id => $child) {
+    $stmt = $conn->prepare("
+        SELECT 
+            SUM(CASE WHEN status='Present' THEN 1 ELSE 0 END) AS present_count,
+            COUNT(*) AS total_count
+        FROM attendance
+        WHERE student_id = ?
+    ");
+    $stmt->bind_param("i", $child_id);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $row = $res->fetch_assoc();
+    $attendance[$child_id] = ($row['total_count'] > 0) ? round(($row['present_count'] / $row['total_count']) * 100) : 'N/A';
+    $stmt->close();
+}
+
+// Fetch latest 5 notifications
+$notifications = [];
+$res = $conn->query("SELECT message, created_at FROM notifications ORDER BY created_at DESC LIMIT 5");
+while ($row = $res->fetch_assoc()) {
+    $notifications[] = $row;
+}
+
+// Fetch next PTM for this parent's children
+$next_ptm = null;
+if (!empty($children)) {
+    $child_ids = array_keys($children);
+    $placeholders = implode(',', array_fill(0, count($child_ids), '?'));
+    $types = str_repeat('i', count($child_ids) + 1);
+    $stmt = $conn->prepare("
+        SELECT pb.meeting_date, pb.status, t.teacher_name, s.student_name
+        FROM ptm_bookings pb
+        JOIN teachers t ON pb.teacher_id = t.teacher_id
+        JOIN students s ON pb.child_id = s.student_id
+        WHERE pb.child_id IN ($placeholders)
+          AND pb.booked_by = ?
+          AND pb.meeting_date >= CURDATE()
+        ORDER BY pb.meeting_date ASC
+        LIMIT 1
+    ");
+    $params = array_merge($child_ids, [$parent_id]);
+    $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $next_ptm = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+}
+?>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Admin Dashboard — EMIS Portal</title>
-    <link rel="stylesheet" href="../assets/styles.css">
-    <link rel="stylesheet" href="../assets/sidebar.css">
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
-    <style>
-        .main {
-            padding: 20px;
-        }
-        .card {
-            background: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            padding: 20px;
-            margin-top: 20px;
-        }
-        h2 {
-            margin-bottom: 20px;
-            color: #333;
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .stat-card {
-            background: #fff;
-            border-radius: 8px;
-            padding: 20px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        .stat-card small {
-            color: #6c757d;
-            font-size: 0.9em;
-        }
-        .stat-card h2 {
-            margin: 10px 0 0;
-            font-size: 2.5rem;
-            color: #0d6efd;
-        }
-        .header-actions {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-        .table-responsive {
-            overflow-x: auto;
-            -webkit-overflow-scrolling: touch;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-        }
-        th, td {
-            padding: 12px;
-            border: 1px solid #ddd;
-            text-align: left;
-        }
-        th {
-            background-color: #f8f9fa;
-            font-weight: 600;
-        }
-        .btn {
-            padding: 10px 18px;
-            background: #0d6efd;
-            color: white;
-            text-decoration: none;
-            border-radius: 6px;
-            font-size: 14px;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .btn:hover {
-            background: #0b5ed7;
-        }
-        .btn-outline {
-            background: transparent;
-            color: #0d6efd;
-            border: 1px solid #0d6efd;
-        }
-        .btn-outline:hover {
-            background: #0d6efd;
-            color: white;
-        }
-        .btn-sm {
-            padding: 8px 14px;
-            font-size: 13px;
-        }
-        .quick-actions {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-        }
-        .empty {
-            text-align: center;
-            color: #6c757d;
-            padding: 20px;
-            font-style: italic;
-        }
-    </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Parent Dashboard — School Portal</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+  <link rel="stylesheet" href="../assets/sidebar.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
 </head>
 <body>
-
 <div class="container">
-    <?php include '../partials/sidebar.php'; ?>
+  <div class="col-lg-2 d-none d-lg-block bg-white glass shadow-sm position-sticky top-0">
+    <div class="pt-4 px-lg-2 pt-5">
+      <?php include '../partials/sidebar.php'; ?>
+    </div>
+  </div>
 
-    <main class="main">
-        <h2>Admin Dashboard</h2>
-
-        <!-- Stats Cards -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <small>Total Students</small>
-                <h2><?= $studentsCount ?></h2>
-            </div>
-            <div class="stat-card">
-                <small>Total Teachers</small>
-                <h2><?= $teachersCount ?></h2>
-            </div>
-            <div class="stat-card">
-                <small>Total Classes</small>
-                <h2><?= $classesCount ?></h2>
-            </div>
+  <main class="main">
+    <div class="header">
+      <div style="display:flex;gap:12px;align-items:center">
+        <div style="font-size:20px;font-weight:700">Parent Dashboard</div>
+     
+      <div style="display:flex;gap:12px;align-items:flex-end">
+        <div style="display:flex;gap:10px;align-items:flex-end">
+          <div style="display:flex;flex-direction:column;align-items:flex-end">
+            <div style="font-size:13px;font-weight:700"><?= htmlspecialchars($_SESSION['username'] ?? 'Parent') ?></div>
+            <div style="font-size:12px;color:var(--muted)">Parent</div>
+          </div>
         </div>
-
-        <!-- Recent Activity -->
-        <div class="card">
-            <div class="header-actions">
-                <h5 class="mb-0 fw-bold">Recent User Registrations</h5>
-                <a href="admin-students.php" class="btn btn-sm">Manage Students</a>
-            </div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>User</th>
-                            <th>Registration Date</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php if ($recentActivity->num_rows > 0): ?>
-                            <?php while ($row = $recentActivity->fetch_assoc()): ?>
-                                <tr>
-                                    <td><?= htmlspecialchars($row['username']) ?></td>
-                                    <td><?= htmlspecialchars($row['creation_date']) ?></td>
-                                </tr>
-                            <?php endwhile; ?>
-                        <?php else: ?>
-                            <tr>
-                                <td colspan="2" class="empty">No recent registrations</td>
-                            </tr>
-                        <?php endif; ?>
-                    </tbody>
-                </table>
-            </div>
+      </div>
+    </div>
+ </div>
+    <div class="grid">
+      <?php foreach ($children as $child_id => $child): ?>
+      <div class="card">
+        <div style="font-weight:700">Child</div>
+        <div style="margin-top:8px;color:var(--muted)">
+          <?= htmlspecialchars($child['student_name']) ?> — <?= htmlspecialchars($child['class_name']) ?>
         </div>
+      </div>
 
-        <!-- Quick Actions -->
-        <div class="card">
-            <h5 class="fw-bold mb-3">Quick Actions</h5>
-            <div class="quick-actions">
-                <a href="add_teacher.php" class="btn">
-                    <i class="bi bi-person-plus"></i> Add Teacher
-                </a>
-                <a href="create_session.php" class="btn btn-outline">
-                    <i class="bi bi-calendar-plus"></i> Create Session
-                </a>
-                <a href="create_class.php" class="btn btn-outline">
-                    <i class="bi bi-building"></i> Create Class
-                </a>
-                <a href="manage_groups.php" class="btn btn-outline">
-                    <i class="bi bi-book"></i> Manage Groups
-                </a>
-                  <a href="result.php" class="btn btn-outline">
-                    <i class="bi bi-trophy"></i> View Results
-                </a>
-                <a href="view-ptm.php" class="btn btn-outline">
-                    <i class="bi bi-calendar"></i> View PTMS
-                </a>
-                <a href="add_notification.php" class="btn btn-outline">
-                    <i class="bi bi-bell"></i> Create Notification
-                </a>
-            </div>
+      <div class="card">
+        <div style="font-weight:700">Attendance</div>
+        <div style="margin-top:8px;color:var(--muted)">
+          <?= htmlspecialchars($child['student_name']) ?> — <?= htmlspecialchars($attendance[$child_id]) ?>% this term
         </div>
-    </main>
+      </div>
+      <?php endforeach; ?>
+
+      <div class="card">
+        <div style="font-weight:700">Next PTM</div>
+        <?php if ($next_ptm): ?>
+          <div style="margin-top:8px;color:green;font-weight:500">
+            <?= htmlspecialchars($next_ptm['student_name']) ?> with <?= htmlspecialchars($next_ptm['teacher_name']) ?><br>
+            on <?= date('d M Y', strtotime($next_ptm['meeting_date'])) ?> — <?= htmlspecialchars($next_ptm['status']) ?>
+          </div>
+        <?php else: ?>
+          <a href="ptm-scheduler.php" style="text-decoration:none;color:inherit">
+            <div style="margin-top:8px;color:var(--muted)">Book a slot</div>
+          </a>
+        <?php endif; ?>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:700">Notifications</div>
+      <ul style="margin-top:8px;color:var(--muted);padding-left:20px">
+        <?php if ($notifications): ?>
+          <?php foreach ($notifications as $note): ?>
+            <li><?= htmlspecialchars($note['message']) ?> <small>(<?= date('d M Y', strtotime($note['created_at'])) ?>)</small></li>
+          <?php endforeach; ?>
+        <?php else: ?>
+          <li>No notifications</li>
+        <?php endif; ?>
+      </ul>
+    </div>
+  </main>
 </div>
-
 </body>
 </html>
+
